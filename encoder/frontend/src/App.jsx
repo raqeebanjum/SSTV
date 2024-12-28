@@ -1,35 +1,48 @@
 import React, { useState } from "react";
+import axios from "axios";
 
 const App = () => {
-  const [image, setImage] = useState(null); // State for uploaded image
-  const [audio, setAudio] = useState(null); // State for generated audio
+  const [image, setImage] = useState(null); // State for uploaded image preview
+  const [audioPath, setAudioPath] = useState(null); // State for generated audio path
+  const [loading, setLoading] = useState(false); // State to show loading status
 
-  // Handle image upload and trigger audio generation
-  const handleImageUpload = (event) => {
+  // Handle image upload
+  const handleImageUpload = async (event) => {
     const file = event.target.files[0];
     if (file) {
+      // Preview the image
       const reader = new FileReader();
-      reader.onload = (e) => {
-        setImage(e.target.result);
-        generateAudio(e.target.result); // Trigger audio generation
-      };
+      reader.onload = (e) => setImage(e.target.result);
       reader.readAsDataURL(file);
+
+      // Send the image to the backend
+      const formData = new FormData();
+      formData.append("file", file);
+
+      try {
+        setLoading(true); // Start loading
+        const response = await axios.post("http://127.0.0.1:8000/encode", formData, {
+          headers: { "Content-Type": "multipart/form-data" },
+        });
+
+        console.log("Backend response:", response.data); // Log the backend response
+        setAudioPath(response.data.audio_path); // Update audioPath state with backend response
+      } catch (error) {
+        console.error("Error generating audio:", error);
+        alert("Failed to generate audio. Please try again.");
+      } finally {
+        setLoading(false); // Stop loading
+      }
     }
   };
 
-  // Placeholder for audio generation
-  const generateAudio = (imageData) => {
-    console.log("Generating audio for image:", imageData); // Debug log
-    alert("Audio generation started!"); // Temporary placeholder
-    setAudio(new Audio("path-to-generated-audio.wav")); // Replace with real audio generation
-  };
-
-  // Play the generated audio
+  // Play the audio
   const playAudio = () => {
-    if (audio) {
+    if (audioPath) {
+      const audio = new Audio(`http://127.0.0.1:8000/${audioPath}`);
       audio.play();
     } else {
-      alert("No audio generated yet!");
+      alert("No audio available to play!");
     }
   };
 
@@ -48,6 +61,9 @@ const App = () => {
         />
       </label>
 
+      {/* Loading Indicator */}
+      {loading && <p className="text-blue-500 mt-4">Generating audio...</p>}
+
       {/* Image Preview */}
       {image && (
         <div className="mt-4 p-4 border rounded shadow bg-white">
@@ -57,11 +73,13 @@ const App = () => {
       )}
 
       {/* Audio Controls */}
-      <div className="mt-4">
-        <button className="btn btn-accent" onClick={playAudio}>
-          Play Audio
-        </button>
-      </div>
+      {audioPath && (
+        <div className="mt-4">
+          <button className="btn btn-accent" onClick={playAudio}>
+            Play Generated Audio
+          </button>
+        </div>
+      )}
     </div>
   );
 };
