@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "concurrently": "^9.1.1"
+  },
+  "scripts": {
+    "start": "concurrently \"npm run dev --prefix frontend\" \"cd backend && ../backend/venv/bin/uvicorn app:app --reload\"",
+    "dev": "vite",
+    "build": "vite build"
+  }
+}
