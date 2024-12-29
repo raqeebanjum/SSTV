@@ -2,106 +2,148 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-
 import numpy as np
 import os
 import soundfile as sf
 from PIL import Image
+from scipy import signal
+import traceback
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Ensure a directory exists to save decoded files
 os.makedirs("decoded", exist_ok=True)
-
-# Serve the 'decoded' directory at '/decoded'
 app.mount("/decoded", StaticFiles(directory="decoded"), name="decoded")
 
-# Custom Encoding Constants
+# SSTV Constants
 SAMPLE_RATE = 44100
-FREQS_FOR_NOTES = [500, 600, 700, 800, 900]  # Intro frequencies
-NOTE_DURATION = 0.5  # Duration of each intro note
-PIXEL_DURATION = 0.001  # Duration for each pixel frequency
-BASE_PIXEL_FREQ = 1000  # Base frequency for pixel encoding
-PIXEL_STEP = 2  # Frequency step per intensity value
+BLACK_FREQ = 1500
+WHITE_FREQ = 2300
+SYNC_FREQ = 1200
 
+def find_start(audio_data):
+    """Find start of image data by detecting leader tone"""
+    window_size = int(0.1 * SAMPLE_RATE)
+    for i in range(0, len(audio_data) - window_size, window_size // 2):
+        chunk = audio_data[i:i + window_size]
+        freqs = np.fft.fftfreq(len(chunk), 1/SAMPLE_RATE)
+        fft = np.abs(np.fft.fft(chunk))
+        peak_freq = freqs[np.argmax(fft)]
+        if abs(peak_freq - 1900) < 100:  # Leader tone found
+            return i + window_size
+    return 0
 
-def decode_audio_to_image(audio_data):
-    """
-    Decode a custom-encoded audio signal back into an image.
-    """
-    # Step 1: Extract the intro notes
-    intro_note_samples = int(NOTE_DURATION * SAMPLE_RATE)
-    start = 0
-    for expected_freq in FREQS_FOR_NOTES:
-        tone = audio_data[start : start + intro_note_samples]
-        detected_freq = detect_frequency(tone)
-        if abs(detected_freq - expected_freq) > 5:  # Small tolerance for noise
-            raise ValueError(f"Intro note mismatch: expected {expected_freq} Hz, got {detected_freq} Hz")
-        start += intro_note_samples
+def detect_frequency(chunk):
+    """More accurate frequency detection using zero-crossing rate and FFT"""
+    if len(chunk) < 10:
+        return BLACK_FREQ
+        
+    # Use FFT for frequency detection
+    freqs = np.fft.fftfreq(len(chunk), 1/SAMPLE_RATE)
+    fft = np.abs(np.fft.fft(chunk))
+    
+    # Find peaks in the expected frequency range
+    valid_range = (freqs >= BLACK_FREQ - 200) & (freqs <= WHITE_FREQ + 200)
+    valid_freqs = freqs[valid_range]
+    valid_fft = fft[valid_range]
+    
+    if len(valid_fft) == 0:
+        return BLACK_FREQ
+        
+    peak_idx = np.argmax(valid_fft)
+    return valid_freqs[peak_idx]
 
-    print("Intro notes verified.")
-
-    # Step 2: Decode the pixel frequencies
-    pixel_samples = int(PIXEL_DURATION * SAMPLE_RATE)
-    pixel_values = []
-    while start + pixel_samples <= len(audio_data):
-        tone = audio_data[start : start + pixel_samples]
-        detected_freq = detect_frequency(tone)
-        if detected_freq is None:
+def decode_line(audio_data, start_idx):
+    """Decode one line of image data"""
+    pixels = []
+    sync_samples = int(0.009 * SAMPLE_RATE)  # 9ms sync
+    porch_samples = int(0.003 * SAMPLE_RATE)  # 3ms porch
+    pixel_samples = int(0.00144 * SAMPLE_RATE)  # Pixel duration
+    
+    # Skip sync and porch
+    current_idx = start_idx + sync_samples + porch_samples
+    
+    # Decode pixels
+    for _ in range(320):  # Robot 36 width
+        if current_idx + pixel_samples > len(audio_data):
             break
-        pixel_intensity = int((detected_freq - BASE_PIXEL_FREQ) / PIXEL_STEP)
-        pixel_values.append(pixel_intensity)
-        start += pixel_samples
-
-    # Step 3: Reconstruct the image
-    image_width = 320
-    image_height = len(pixel_values) // image_width
-    pixel_array = np.array(pixel_values[: image_width * image_height]).reshape((image_height, image_width))
-    return pixel_array.astype(np.uint8)
-
-
-def detect_frequency(signal):
-    """
-    Detect the dominant frequency in a signal.
-    """
-    fft = np.fft.rfft(signal)
-    freqs = np.fft.rfftfreq(len(signal), 1 / SAMPLE_RATE)
-    dominant_freq = freqs[np.argmax(np.abs(fft))]
-    return dominant_freq if dominant_freq > 0 else None
-
+            
+        chunk = audio_data[current_idx:current_idx + pixel_samples]
+        freq = detect_frequency(chunk)
+        
+        # Convert frequency to pixel value
+        pixel_value = np.clip((freq - BLACK_FREQ) / (WHITE_FREQ - BLACK_FREQ) * 255, 0, 255)
+        pixels.append(int(pixel_value))
+        
+        current_idx += pixel_samples
+        
+    return pixels, current_idx
 
 @app.post("/decode")
 async def decode_audio(file: UploadFile = File(...)):
     try:
-        print(f"Received file: {file.filename}")  # Log file name
-
-        # Step 1: Read the uploaded audio file
+        print(f"Processing file: {file.filename}")
+        
+        # Read audio file
         audio_data, sample_rate = sf.read(file.file)
-        if sample_rate != SAMPLE_RATE:
-            return JSONResponse(content={"error": "Incorrect sample rate"}, status_code=400)
-        print("Audio file successfully read.")
-
-        # Step 2: Decode the audio into an image
-        pixel_array = decode_audio_to_image(audio_data)
-        print("Audio decoded into an image.")
-
-        # Step 3: Save the reconstructed image
-        decoded_image = Image.fromarray(pixel_array)
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data.mean(axis=1)
+            
+        # Normalize audio
+        audio_data = audio_data / np.max(np.abs(audio_data))
+        
+        # Find start of image data
+        start_pos = find_start(audio_data)
+        print(f"Start position found at sample {start_pos}")
+        
+        # Initialize image array
+        image_data = []
+        current_pos = start_pos
+        
+        # Decode each line
+        for _ in range(240):  # Robot 36 height
+            if current_pos >= len(audio_data):
+                break
+                
+            line_pixels, current_pos = decode_line(audio_data, current_pos)
+            if len(line_pixels) == 320:  # Only add complete lines
+                image_data.append(line_pixels)
+        
+        if not image_data:
+            raise ValueError("No valid image data decoded")
+            
+        # Create image from decoded data
+        image_array = np.array(image_data, dtype=np.uint8)
+        decoded_image = Image.fromarray(image_array)
+        
+        # Enhance contrast
+        decoded_image = Image.fromarray(
+            np.clip((np.array(decoded_image) - 128) * 1.5 + 128, 0, 255).astype(np.uint8)
+        )
+        
+        # Save image
         image_path = f"decoded/{file.filename.split('.')[0]}.png"
         decoded_image.save(image_path)
-        print(f"Decoded image saved at {image_path}.")
-
-        # Return the path to the decoded image
-        return JSONResponse(content={"message": "Audio decoded", "image_path": image_path})
-
+        print(f"Decoded image saved to {image_path}")
+        
+        return JSONResponse(content={
+            "message": "Audio decoded successfully",
+            "image_path": image_path
+        })
+        
     except Exception as e:
-        print(f"Error: {e}")  # Log the error
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        print("\n=== Decoding Error ===")
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {str(e)}")
+        traceback.print_exc()
+        return JSONResponse(
+            content={"error": f"Decoding failed: {str(e)}"},
+            status_code=500
+        )
